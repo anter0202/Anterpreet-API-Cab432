@@ -1,0 +1,30 @@
+version: "3.9"
+services:
+  api:
+    build: .
+    # For EC2 deployment, replace with your ECR image:
+    # image: <acct>.dkr.ecr.<region>.amazonaws.com/pixelsmith:latest
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - images:/data/images
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pixelsmith
+      POSTGRES_USER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pixelsmith"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  images:
+  pgdata:
