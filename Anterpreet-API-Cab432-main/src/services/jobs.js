@@ -1,7 +1,14 @@
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const { pool } = require('../db/pool');
+let dynamo;
+try { dynamo = require('../db/dynamo'); } catch (e) { dynamo = null; }
+// In-memory jobs fallback for local dev if DynamoDB not configured
+let localJobStore = null;
+if (!dynamo || !process.env.DYNAMODB_TABLE_JOBS) {
+  console.warn('Warning: DynamoDB jobs table not configured. Using in-memory job store (dev only).');
+  localJobStore = new Map();
+}
 const { processedPathFor } = require('./imageStore');
 const imageProcess = require('./imageProcess');
 const AWS = require('aws-sdk');
@@ -9,14 +16,38 @@ const s3 = new AWS.S3({ region: process.env.AWS_REGION });
 const BUCKET = process.env.S3_BUCKET;
 
 
-async function createJob(imageId, params = {}) {
+async function createJob(imageId, params = {}, ownerUsername = null) {
   const id = uuidv4();
-  await pool.query(
-    `INSERT INTO jobs(id, image_id, status, params, created_at, updated_at)
-     VALUES($1,$2,'processing',$3,NOW(),NOW())`,
-    [id, imageId, params]
-  );
+  const now = new Date().toISOString();
+  const jobRec = { id, image_id: imageId, status: 'processing', params, created_at: now, updated_at: now, owner_username: ownerUsername };
+  if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+    await dynamo.putJob(jobRec);
+  } else if (localJobStore) {
+    localJobStore.set(id, jobRec);
+  }
   return id;
+}
+
+async function getJob(id) {
+  if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+    return await dynamo.getJob(id);
+  }
+  if (localJobStore) return localJobStore.get(id) || null;
+  return null;
+}
+
+async function queryJobs({ owner = null, status = null, limit = 20, nextToken = null } = {}) {
+  if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+    return await dynamo.queryJobs({ owner, status, limit, nextToken });
+  }
+  const all = Array.from(localJobStore ? localJobStore.values() : []);
+  let filtered = all;
+  if (status) filtered = filtered.filter(j => j.status === status);
+  if (owner) filtered = filtered.filter(j => j.owner_username === owner);
+  // sort by created_at desc
+  filtered.sort((a,b) => (b.created_at||'').localeCompare(a.created_at||''));
+  const items = filtered.slice(0, Math.min(limit, filtered.length));
+  return { items, nextToken: null };
 }
 
 async function runJob(jobId, originalKey) {
@@ -37,8 +68,14 @@ async function runJob(jobId, originalKey) {
       await fs.promises.copyFile(originalKey, tempIn);
     }
 
-    const { rows } = await pool.query(`SELECT params FROM jobs WHERE id=$1`, [jobId]);
-    const params = rows[0]?.params || {};
+    let params = {};
+    if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+      const job = await dynamo.getJob(jobId);
+      params = job?.params || {};
+    } else if (localJobStore) {
+      const job = localJobStore.get(jobId);
+      params = job?.params || {};
+    }
     const result = await imageProcess.heavyProcess(tempIn, tempOut, params);
 
     // upload processed result (S3 if configured, otherwise write to disk)
@@ -59,12 +96,23 @@ async function runJob(jobId, originalKey) {
       outKey = outPath;
     }
 
-    await pool.query(
-      `UPDATE jobs SET status='done', cpu_ms=$2, result_path=$3, updated_at=NOW() WHERE id=$1`,
-      [jobId, Math.round(result.cpuMs), outKey]
-    );
+    if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+      await dynamo.updateJobStatus(jobId, { status: 'done', cpu_ms: Math.round(result.cpuMs), result_path: outKey, updated_at: new Date().toISOString() });
+    } else if (localJobStore) {
+      const job = localJobStore.get(jobId) || {};
+      job.status = 'done'; job.cpu_ms = Math.round(result.cpuMs); job.result_path = outKey; job.updated_at = new Date().toISOString();
+      localJobStore.set(jobId, job);
+    }
   } catch (e) {
-    try { await pool.query(`UPDATE jobs SET status='error', updated_at=NOW() WHERE id=$1`, [jobId]); } catch (e2) { /* ignore */ }
+    try {
+      if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+        await dynamo.updateJobStatus(jobId, { status: 'error', updated_at: new Date().toISOString() });
+      } else if (localJobStore) {
+        const job = localJobStore.get(jobId) || {};
+        job.status = 'error'; job.updated_at = new Date().toISOString();
+        localJobStore.set(jobId, job);
+      }
+    } catch (e2) { /* ignore */ }
     throw e;
   } finally {
     fs.promises.unlink(tempIn).catch(()=>{});
@@ -72,4 +120,29 @@ async function runJob(jobId, originalKey) {
   }
 }
 
-module.exports = { createJob, runJob };
+module.exports = { createJob, runJob, getJob, queryJobs };
+
+async function getJob(id) {
+  if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+    return await dynamo.getJob(id);
+  }
+  if (localJobStore) return localJobStore.get(id) || null;
+  return null;
+}
+
+async function queryJobs({ owner=null, status=null, limit=20, nextToken=null } = {}) {
+  if (dynamo && process.env.DYNAMODB_TABLE_JOBS) {
+    return await dynamo.queryJobs({ owner, status, limit, nextToken });
+  }
+  const all = Array.from(localJobStore ? localJobStore.values() : []);
+  let filtered = all;
+  if (status) filtered = filtered.filter(j => j.status === status);
+  if (owner) filtered = filtered.filter(j => j.owner_username === owner);
+  // sort by created_at desc
+  filtered.sort((a,b) => (b.created_at||'').localeCompare(a.created_at||''));
+  const items = filtered.slice(0, limit);
+  return { items, nextToken: null };
+}
+
+module.exports = { createJob, runJob, getJob, queryJobs };
+

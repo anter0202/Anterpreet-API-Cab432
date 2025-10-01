@@ -5,7 +5,14 @@ const s3 = new AWS.S3({ region: process.env.AWS_REGION });
 const BUCKET = process.env.S3_BUCKET;
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
-const { pool } = require('../db/pool');
+let dynamo;
+try { dynamo = require('../db/dynamo'); } catch (e) { dynamo = null; }
+// If DynamoDB not configured, we'll fall back to an in-memory map (for local dev)
+let localImageStore = null;
+if (!dynamo || !process.env.DYNAMODB_TABLE_IMAGES) {
+  console.warn('Warning: DynamoDB images table not configured. Using in-memory fallback (dev only).');
+  localImageStore = new Map();
+}
 
 
 const ROOT = process.env.DATA_DIR || path.join(process.cwd(), 'data', 'images');
@@ -40,14 +47,17 @@ async function saveUpload(ownerUsername, fileBuffer) {
       ContentType: `image/${ext}`,
     }).promise();
 
-    try {
-      await pool.query(
-        `INSERT INTO images(id, owner_username, original_path, width, height, format, size_bytes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [id, ownerUsername, key, meta.width || 0, meta.height || 0, ext, fileBuffer.length]
-      );
-    } catch (e) {
-      console.error('Warning: failed to write image record to DB:', e && e.message ? e.message : e);
+    // Write metadata to DynamoDB
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      try {
+        await dynamo.putImage({
+          id, owner_username: ownerUsername, original_path: key,
+          width: meta.width || null, height: meta.height || null, format: ext, size_bytes: fileBuffer.length,
+          created_at: new Date().toISOString()
+        });
+      } catch (e) { console.error('Failed to write image record to DynamoDB:', e && e.message ? e.message : e); throw e; }
+    } else if (localImageStore) {
+      localImageStore.set(id, { id, owner_username: ownerUsername, original_path: key, width: meta.width || null, height: meta.height || null, format: ext, size_bytes: fileBuffer.length, created_at: new Date().toISOString() });
     }
 
     return { id, meta: { width: meta.width, height: meta.height }, format: ext, size: fileBuffer.length };
@@ -58,14 +68,16 @@ async function saveUpload(ownerUsername, fileBuffer) {
   await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
   await fs.promises.writeFile(localPath, fileBuffer);
 
-  try {
-    await pool.query(
-      `INSERT INTO images(id, owner_username, original_path, width, height, format, size_bytes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [id, ownerUsername, localPath, meta.width || 0, meta.height || 0, ext, fileBuffer.length]
-    );
-  } catch (e) {
-    console.error('Warning: failed to write local image record to DB:', e && e.message ? e.message : e);
+  if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+    try {
+      await dynamo.putImage({
+        id, owner_username: ownerUsername, original_path: localPath,
+        width: meta.width || null, height: meta.height || null, format: ext, size_bytes: fileBuffer.length,
+        created_at: new Date().toISOString()
+      });
+    } catch (e) { console.error('Failed to write image record to DynamoDB:', e && e.message ? e.message : e); throw e; }
+  } else if (localImageStore) {
+    localImageStore.set(id, { id, owner_username: ownerUsername, original_path: localPath, width: meta.width || null, height: meta.height || null, format: ext, size_bytes: fileBuffer.length, created_at: new Date().toISOString() });
   }
 
   return { id, meta: { width: meta.width, height: meta.height }, format: ext, size: fileBuffer.length };
@@ -75,11 +87,11 @@ async function recordImported(ownerUsername, filePath) {
   const id = uuidv4();
   const meta = await sharp(filePath).metadata();
   const stat = await fs.promises.stat(filePath);
-  await pool.query(
-    `INSERT INTO images(id, owner_username, original_path, width, height, format, size_bytes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [id, ownerUsername, filePath, meta.width || null, meta.height || null, (meta.format||'jpg'), stat.size]
-  );
+  if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+    await dynamo.putImage({ id, owner_username: ownerUsername, original_path: filePath, width: meta.width || null, height: meta.height || null, format: (meta.format||'jpg'), size_bytes: stat.size, created_at: new Date().toISOString() });
+  } else if (localImageStore) {
+    localImageStore.set(id, { id, owner_username: ownerUsername, original_path: filePath, width: meta.width || null, height: meta.height || null, format: (meta.format||'jpg'), size_bytes: stat.size, created_at: new Date().toISOString() });
+  }
   return { id, path: filePath, meta, size: stat.size, format: (meta.format||'jpg') };
 }
 
@@ -89,5 +101,27 @@ module.exports = {
   processedPathFor,
   saveUpload,
   recordImported,
-  ROOT, ORIGINALS, PROCESSED
+  ROOT, ORIGINALS, PROCESSED,
+  // helper: get image by id (reads from DynamoDB when configured, otherwise from local in-memory store)
+  getImage: async function(id) {
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      return await dynamo.getImage(id);
+    }
+    if (localImageStore) return localImageStore.get(id) || null;
+    return null;
+  },
+  // helper: query images (DynamoDB when configured, otherwise simple in-memory pagination/filter)
+  queryImages: async function({ owner=null, format=null, limit=20, nextToken=null } = {}) {
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      return await dynamo.queryImages({ owner, format, limit, nextToken });
+    }
+    const all = Array.from(localImageStore ? localImageStore.values() : []);
+    let filtered = all.filter(it => !format || it.format === String(format).toLowerCase());
+    if (owner) filtered = filtered.filter(it => it.owner_username === owner);
+    // sort by created_at desc if present
+    filtered.sort((a,b) => (b.created_at||'') .localeCompare(a.created_at||''));
+    const items = filtered.slice(0, limit);
+    return { items, nextToken: null };
+  }
 };
+

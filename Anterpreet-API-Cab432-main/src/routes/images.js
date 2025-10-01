@@ -4,8 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { verify } = require('../middleware/auth');
-const { pool } = require('../db/pool');
-const { saveUpload, recordImported } = require('../services/imageStore');
+let dynamo;
+try { dynamo = require('../db/dynamo'); } catch (e) { dynamo = null; }
+// Use the shared imageStore service which has its own in-memory fallback when DynamoDB is not configured.
+const imageStore = require('../services/imageStore');
+const { saveUpload, recordImported, queryImages, getImage } = imageStore;
 const { importRandomImage } = require('../services/external');
 const AWS = require('aws-sdk');
 const s3 = new AWS.S3({ region: process.env.AWS_REGION });
@@ -19,7 +22,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 
 router.post('/', verify, upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'missing_file' });
-    const saved = await saveUpload(req.user.username, req.file.buffer);
+    const saved = await imageStore.saveUpload(req.user.username, req.file.buffer);
     res.status(201).json({ id: saved.id, meta: saved.meta, size: saved.size, format: saved.format });
   } catch (e) { next(e); }
 });
@@ -28,7 +31,7 @@ router.post('/', verify, upload.single('file'), async (req, res, next) => {
 router.post('/import', verify, async (req, res, next) => {
   try {
     const buf = await importRandomImage();
-    const saved = await saveUpload(req.user.username, buf);
+    const saved = await imageStore.saveUpload(req.user.username, buf);
     res.status(201).json({
       id: saved.id, width: saved.meta.width, height: saved.meta.height,
       format: saved.format, size_bytes: saved.size
@@ -40,72 +43,75 @@ router.post('/import', verify, async (req, res, next) => {
 router.get('/', verify, async (req, res, next) => {
   try {
     const { owner, format, sort='created_at', order='desc', limit='20', page='1' } = req.query;
+    // Debug: log inbound list requests (helpful for client refresh troubleshooting)
+    try { console.debug('[images] list request owner=%s from=%s auth=%s', owner, req.ip || req.connection.remoteAddress, (req.headers.authorization || '').slice(0,40)); } catch(e){}
     const lim = Math.min(100, Math.max(1, parseInt(limit)));
     const pg = Math.max(1, parseInt(page));
     const off = (pg-1)*lim;
-
-    let where = [];
-    let params = [];
-    if (owner === 'me') {
-      params.push(req.user.username);
-      where.push(`owner_username = $${params.length}`);
+    // owner param 'me' maps to username
+    const ownerFilter = owner === 'me' ? req.user.username : owner;
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      const { items, nextToken } = await dynamo.queryImages({ owner: ownerFilter, format, limit: lim, nextToken: req.query.nextToken });
+      if (nextToken) res.set('X-Next-Token', nextToken);
+      return res.json(items);
     }
-    if (format) {
-      params.push(String(format).toLowerCase());
-      where.push(`format = $${params.length}`);
-    }
-    const whereSql = where.length ? ('WHERE ' + where.join(' AND ')) : '';
-    const sortCol = ['created_at','format','size_bytes','width','height'].includes(sort) ? sort : 'created_at';
-    const sortOrd = (String(order).toLowerCase() === 'asc' ? 'asc' : 'desc');
-
-    const countSql = `SELECT COUNT(*) AS c FROM images ${whereSql}`;
-    const { rows: cr } = await pool.query(countSql, params);
-    const total = parseInt(cr[0].c, 10);
-
-    const dataSql = `SELECT id, owner_username, width, height, format, size_bytes, created_at
-                     FROM images ${whereSql}
-                     ORDER BY ${sortCol} ${sortOrd}
-                     LIMIT ${lim} OFFSET ${off}`;
-    const { rows } = await pool.query(dataSql, params);
-
-    // Pagination headers
-    res.set('X-Total-Count', String(total));
-    const baseUrl = req.protocol + '://' + req.get('host') + req.baseUrl;
-    const links = [];
-    const q = new URLSearchParams(req.query);
-    if (off + lim < total) { q.set('page', String(pg+1)); links.push(`<${baseUrl}?${q.toString()}>; rel="next"`); }
-    if (pg > 1) { q.set('page', String(pg-1)); links.push(`<${baseUrl}?${q.toString()}>; rel="prev"`); }
-    if (links.length) res.set('Link', links.join(', '));
-
-    res.json(rows);
+    // Fallback: use imageStore.queryImages which will consult the in-memory store when DynamoDB not configured
+    const { items } = await imageStore.queryImages({ owner: ownerFilter, format, limit: lim, nextToken: req.query.nextToken });
+    return res.json(items);
   } catch (e) { next(e); }
 });
 
 // Get metadata
 router.get('/:id', verify, async (req, res, next) => {
   try {
-    const { rows } = await pool.query(`SELECT * FROM images WHERE id=$1`, [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'not_found' });
-    const row = rows[0];
-    if (req.user.role !== 'admin' && row.owner_username !== req.user.username) {
-      return res.status(403).json({ error: 'forbidden' });
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      const item = await dynamo.getImage(req.params.id);
+      if (!item) return res.status(404).json({ error: 'not_found' });
+      if (req.user.role !== 'admin' && item.owner_username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+      return res.json(item);
     }
-    res.json(row);
+    // in-memory fallback (use imageStore.getImage)
+    const it = await imageStore.getImage(req.params.id);
+    if (!it) return res.status(404).json({ error: 'not_found' });
+    if (req.user.role !== 'admin' && it.owner_username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+    res.json(it);
   } catch (e) { next(e); }
 });
 
 // Download
 router.get('/:id/download', verify, async (req, res, next) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT original_path, format, owner_username FROM images WHERE id=$1`, [req.params.id]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'not_found' });
-    const rec = rows[0];
-    if (req.user.role !== 'admin' && rec.owner_username !== req.user.username)
-      return res.status(403).json({ error: 'forbidden' });
+    if (dynamo && process.env.DYNAMODB_TABLE_IMAGES) {
+      const item = await dynamo.getImage(req.params.id);
+      if (!item) return res.status(404).json({ error: 'not_found' });
+      if (req.user.role !== 'admin' && item.owner_username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+      const key = item.original_path;
+      if (BUCKET) {
+        const head = await s3.headObject({ Bucket: BUCKET, Key: key }).promise();
+        if (req.headers['if-none-match'] === head.ETag) return res.status(304).end();
+        res.set('ETag', head.ETag);
+        res.set('Cache-Control', 'public, max-age=31536000, immutable');
+        if (head.ContentType) res.type(head.ContentType);
 
-    const key = rec.original_path;
+        s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream()
+          .on('error', next)
+          .pipe(res);
+      } else {
+        // Local file path stored in DB
+        const localPath = key;
+        if (!localPath) return res.status(404).json({ error: 'not_found' });
+        res.set('Cache-Control', 'no-cache');
+        res.type(path.extname(localPath).slice(1) || 'octet-stream');
+        fs.createReadStream(localPath).on('error', next).pipe(res);
+      }
+      return;
+    }
+
+  // in-memory fallback (use imageStore.getImage)
+  const rec = await imageStore.getImage(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'not_found' });
+  if (req.user.role !== 'admin' && rec.owner_username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+  const key = rec.original_path;
 
     if (BUCKET) {
       const head = await s3.headObject({ Bucket: BUCKET, Key: key }).promise();

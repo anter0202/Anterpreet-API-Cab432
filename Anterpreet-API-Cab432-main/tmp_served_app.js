@@ -1,39 +1,19 @@
-const state = { token: null, user: null, selectedImageId: null, images: [], jobs: [] };
-const $ = sel => document.querySelector(sel);
-const host = location.origin;
-
-function setAuthVisible(v) { $('#auth').style.display = v ? '' : 'none'; }
-function setActionsVisible(v) { $('#actions').style.display = v ? '' : 'none'; }
-
-async function login() {
-  const username = $('#username').value.trim();
-  const password = $('#password').value.trim();
-  const res = await fetch('/api/v1/auth/login', {
-    method: 'POST', headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ username, password })
-  });
-  if (!res.ok) { alert('Login failed'); return; }
-  const data = await res.json();
-  state.token = data.token;
-  state.user = data.user;
-  $('#who').textContent = `Signed in as ${state.user.username} (${state.user.role})`;
-  setAuthVisible(false);
+// tmp_served_app.js - removed stale client bundle
+// This file previously contained a built client with hard-coded remote API hosts.
+// To avoid accidentally serving stale or externally-pointing assets, the file
+// content has been replaced. Use the canonical client at ./client/app.js instead.
   setActionsVisible(true);
   await refresh();
 }
 
 async function refresh() {
-  console.debug('[client] refresh triggered, token present=%s', !!state.token);
   await Promise.all([loadImages(), loadJobs()]);
 }
 
 async function loadImages() {
-  const res = await fetch('/api/v1/images?owner=me&limit=50&page=1&sort=created_at&order=desc', {
-    headers: { 'Authorization': 'Bearer ' + state.token },
-    cache: 'no-store'
+  const res = await fetch('http://3.106.115.203:5432/api/v1/images?owner=me&limit=50&page=1&sort=created_at&order=desc', {
+    headers: { 'Authorization': 'Bearer ' + state.token }
   });
-  if (res.status === 304) { console.debug('[client] loadImages: 304 Not Modified'); return; }
-  if (!res.ok) { console.error('[client] loadImages failed', res.status); return; }
   const list = await res.json();
   state.images = list;
   const tbody = $('#imagesTable tbody');
@@ -54,12 +34,9 @@ async function loadImages() {
 }
 
 async function loadJobs() {
-  const res = await fetch('/api/v1/jobs?limit=50&page=1', {
-    headers: { 'Authorization': 'Bearer ' + state.token },
-    cache: 'no-store'
+  const res = await fetch('http://3.106.115.203:5432/api/v1/jobs?limit=50&page=1', {
+    headers: { 'Authorization': 'Bearer ' + state.token }
   });
-  if (res.status === 304) { console.debug('[client] loadJobs: 304 Not Modified'); return; }
-  if (!res.ok) { console.error('[client] loadJobs failed', res.status); return; }
   const list = await res.json();
   state.jobs = list;
   const tbody = $('#jobsTable tbody');
@@ -82,7 +59,7 @@ async function uploadFile() {
   if (!file) return alert('Choose a file');
   const fd = new FormData();
   fd.append('file', file);
-  const res = await fetch('/api/v1/images', {
+  const res = await fetch('http://3.106.115.203:5432/api/v1/images', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + state.token },
     body: fd
@@ -92,7 +69,7 @@ async function uploadFile() {
 }
 
 async function importRandom() {
-  const res = await fetch('/api/v1/images/import', {
+  const res = await fetch('http://3.106.115.203:5432/api/v1/images/import', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + state.token }
   });
@@ -104,7 +81,7 @@ async function processSelected() {
   if (!state.selectedImageId) return alert('Select an image first (press Select)');
   const preset = $('#preset').value;
   const repeats = parseInt($('#repeats').value, 10) || 1;
-  const res = await fetch('/api/v1/jobs', {
+  const res = await fetch('http://3.106.115.203:5432/api/v1/jobs', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + state.token, 'Content-Type': 'application/json' },
     body: JSON.stringify({ imageId: state.selectedImageId, params: { preset, repeats } })
