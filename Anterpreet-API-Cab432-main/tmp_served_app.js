@@ -4,7 +4,7 @@
 // content has been replaced. Use the canonical client at ./client/app.js instead.
   setActionsVisible(true);
   await refresh();
-}
+
 
 async function refresh() {
   await Promise.all([loadImages(), loadJobs()]);
